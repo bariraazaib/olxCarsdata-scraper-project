@@ -1,0 +1,38 @@
+name: OLX Cars Scraper
+
+on:
+  schedule:
+    # Runs daily at 21:00 UTC = 2:00 AM Pakistan time (next day)
+    - cron: '0 21 * * *'
+  workflow_dispatch: {}   # this lets you also click "Run workflow" manually to test
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r Requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      - name: Run the spider
+        run: |
+          scrapy crawl olx_cars -a url_file=listing_urls.txt -O olx_cars_data.csv 2>&1 | tee run_log.txt
+
+      - name: Commit and push updated data
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add olx_cars_data.csv run_log.txt
+          git commit -m "Automated scrape: update data" || echo "No changes to commit"
+          git push

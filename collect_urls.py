@@ -20,26 +20,22 @@ Edit TARGET_COUNT / BASE_URL / MAX_PAGES below as needed.
 from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://www.olx.com.pk/cars_c84"
-TARGET_COUNT = 220           # aim slightly above 200 to allow for dedup/skips
+TARGET_COUNT = 72000          # collect up to this many listing URLs
 OUTPUT_FILE = "listing_urls.txt"
-MAX_PAGES = 10               # safety cap
-SCROLL_ROUNDS_PER_PAGE = 3   # a couple of scrolls per page in case that
-                             # page itself lazy-loads a few more cards
+MAX_PAGES = 2000              # safety cap - raise if OLX has more pages than this
+SCROLL_ROUNDS_PER_PAGE = 3    # a couple of scrolls per page in case that
+                              # page itself lazy-loads a few more cards
 SCROLL_PAUSE_MS = 900
-
-# Use the Chrome/Edge already installed on this machine instead of having
-# Playwright download its own Chromium build - fixes environments where
-# that download times out (network/firewall issues). Try "chrome" first;
-# if Chrome isn't installed, change this to "msedge" (Edge ships with
-# every Windows PC by default).
-BROWSER_CHANNEL = "chrome"
 
 
 def collect_urls():
     urls = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, channel=BROWSER_CHANNEL)
+        # Uses Playwright's own bundled Chromium (installed via
+        # `playwright install chromium`) - works reliably on GitHub Actions
+        # runners without depending on a system Chrome/Edge install.
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         for page_num in range(1, MAX_PAGES + 1):

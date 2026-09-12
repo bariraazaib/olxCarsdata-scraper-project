@@ -1,0 +1,89 @@
+name: OLX Full Scrape (All Cars)
+
+on:
+  workflow_dispatch: {}   # only runs when you click "Run workflow" manually
+
+jobs:
+  # Step 1: split the big URL list into 8 smaller chunks
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Split URLs into 8 chunks
+        run: split -n l/8 -d --additional-suffix=.txt listing_urls.txt url_chunk_
+
+      - name: Upload chunks so the parallel jobs can use them
+        uses: actions/upload-artifact@v4
+        with:
+          name: url-chunks
+          path: url_chunk_*.txt
+
+  # Step 2: 8 jobs run at the SAME TIME, each scraping 1/8th of the cars
+  scrape:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ['00', '01', '02', '03', '04', '05', '06', '07']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r Requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      - name: Download this job's URL chunk
+        uses: actions/download-artifact@v4
+        with:
+          name: url-chunks
+
+      - name: Scrape chunk ${{ matrix.chunk }}
+        run: |
+          scrapy crawl olx_cars -a url_file=url_chunk_${{ matrix.chunk }}.txt -O output_${{ matrix.chunk }}.csv 2>&1 | tee log_${{ matrix.chunk }}.txt
+
+      - name: Upload this chunk's result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.chunk }}
+          path: output_${{ matrix.chunk }}.csv
+
+  # Step 3: once all 8 finish, merge them into one final CSV and push it
+  merge:
+    needs: scrape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all chunk results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+
+      - name: Merge all CSVs into one file
+        run: |
+          pip install pandas
+          python3 -c "
+          import pandas as pd, glob
+          files = glob.glob('results/*.csv')
+          df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+          df.to_csv('olx_cars_data.csv', index=False)
+          print(f'Merged {len(files)} files, total rows: {len(df)}')
+          "
+
+      - name: Commit and push final merged data
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add olx_cars_data.csv
+          git commit -m "Full scrape: merged all 8 chunks" || echo "No changes to commit"
+          git push

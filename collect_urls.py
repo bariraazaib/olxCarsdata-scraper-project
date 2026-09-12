@@ -76,6 +76,7 @@ def build_seed_urls():
 
 def collect_from_url(page, base_url, all_urls):
     found_here = 0
+    consecutive_empty = 0
     for page_num in range(1, MAX_PAGES_PER_URL + 1):
         url = base_url if page_num == 1 else f"{base_url}{'&' if '?' in base_url else '?'}page={page_num}"
         try:
@@ -105,8 +106,14 @@ def collect_from_url(page, base_url, all_urls):
 
         if found_here >= TARGET_PER_URL:
             break
+
         if new_here == 0 and page_num > 1:
-            print("  no new listings on this page - moving to next seed URL")
+            consecutive_empty += 1
+        else:
+            consecutive_empty = 0
+
+        if consecutive_empty >= 3:
+            print("  3 pages in a row with no new listings - moving to next seed URL")
             break
 
 

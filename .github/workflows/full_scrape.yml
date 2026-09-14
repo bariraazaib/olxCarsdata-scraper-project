@@ -37,9 +37,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r Requirements.txt
 
-      - name: Install Playwright browsers
-        run: playwright install --with-deps chromium
-
       - name: Download this job's URL chunk
         uses: actions/download-artifact@v4
         with:

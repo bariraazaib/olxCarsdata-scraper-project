@@ -21,13 +21,19 @@ class OlxCarsSpider(scrapy.Spider):
         "RANDOMIZE_DOWNLOAD_DELAY": True,
     }
 
-    def __init__(self, start_url=None, max_pages=None, url_file=None, *args, **kwargs):
+    def __init__(self, start_url=None, max_pages=None, url_file=None,
+                 start_index=None, end_index=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if start_url:
             self.start_urls = [start_url]
         self.max_pages = int(max_pages) if max_pages else None
         self._page_count = 0
         self.url_file = url_file
+        # Slice of the url_file to process this run (0-based, end exclusive)
+        # - used for GitHub Actions chunking so one run only does a portion
+        # of the full URL list, staying well under the 6-hour job limit.
+        self.start_index = int(start_index) if start_index is not None else 0
+        self.end_index = int(end_index) if end_index is not None else None
 
     def start_requests(self):
         self.logger.info(f"DEBUG: self.url_file = {self.url_file!r}")
@@ -38,8 +44,15 @@ class OlxCarsSpider(scrapy.Spider):
         if self.url_file:
             with open(self.url_file, "r", encoding="utf-8") as f:
                 urls = [line.strip() for line in f if line.strip()]
-            self.logger.info(f"Loaded {len(urls)} URLs from {self.url_file}")
-            for url in urls:
+
+            total = len(urls)
+            chunk = urls[self.start_index:self.end_index]
+            self.logger.info(
+                f"Loaded {total} URLs from {self.url_file}; "
+                f"processing slice [{self.start_index}:{self.end_index}] "
+                f"= {len(chunk)} URLs this run"
+            )
+            for url in chunk:
                 listing_id = self._extract_listing_id(url)
                 if not listing_id:
                     continue
@@ -80,7 +93,6 @@ class OlxCarsSpider(scrapy.Spider):
             location = self._clean(card.css('[aria-label="Location"]::text').get())
             posted_raw = self._clean(card.css('[aria-label="Creation date"]::text').get())
 
-            # Skip if this card isn't actually a car ad (defensive)
             if not listing_id:
                 continue
 
@@ -96,7 +108,6 @@ class OlxCarsSpider(scrapy.Spider):
             }
             yield scrapy.Request(item_url, callback=self.parse_detail, meta=meta)
 
-        # pagination
         self._page_count += 1
         if self.max_pages and self._page_count >= self.max_pages:
             return
@@ -108,26 +119,12 @@ class OlxCarsSpider(scrapy.Spider):
             next_url = urljoin(str(response.url), str(next_page))
             yield scrapy.Request(next_url, callback=self.parse)
 
-    # ------------------------------------------------------------------
-    # DETAIL PAGE
-    # PRIMARY source: the schema.org JSON-LD block OLX embeds in every
-    # listing's raw HTML (for Google/SEO). This is structured data with
-    # stable field names (brand, model, vehicleTransmission, bodyType,
-    # additionalProperty: Assembly / Registration City, etc) - unlike the
-    # visible DOM, it does NOT depend on OLX's auto-generated CSS-module
-    # class names, which we've seen change/collide between listings.
-    # BACKUP sources (used only for whatever JSON-LD doesn't cover):
-    #   - the 'Details' spec grid (div._90eadc7c rows)
-    #   - the quick-facts icon row near the top (Year/Transmission icons)
-    #   - a plain text-label search as a last resort
-    # ------------------------------------------------------------------
     def parse_detail(self, response):
         item = OlxCarItem()
         meta = response.meta
 
         jsonld = self._extract_jsonld(response)
 
-        # merge in priority order: quick-facts < Details grid < JSON-LD
         details = {
             **self._extract_quick_facts(response),
             **self._extract_details_dict(response),
@@ -141,8 +138,6 @@ class OlxCarsSpider(scrapy.Spider):
         title = jsonld.get("_title") or self._clean(response.css("h1::text").get()) or meta.get("title")
         item["title"] = title
 
-        # price: prefer JSON-LD's offer price if present, else the
-        # confirmed-working card price
         item["price"] = jsonld.get("_price") or self._parse_price(meta.get("price_text"))
 
         item["year"] = self._to_int(details.get("year")) or self._to_int(meta.get("year"))
@@ -175,7 +170,7 @@ class OlxCarsSpider(scrapy.Spider):
             details.get("make") or self._label_fallback(response, "Make") or self._guess_make(title)
         )
 
-        item["_model_raw"] = details.get("model")  # pipeline prefers this over title-parsing
+        item["_model_raw"] = details.get("model")
 
         item["listing_city"] = meta.get("listing_city") or self._extract_location(response)
         item["_posted_raw"] = meta.get("posted_raw") or self._extract_posted(response)
@@ -225,7 +220,6 @@ class OlxCarsSpider(scrapy.Spider):
 
     @staticmethod
     def _parse_price(price_text):
-        """Turns 'Rs 33 Lacs' / 'Rs 1.2 Crore' / 'Rs 950,000' into an int PKR value."""
         if not price_text:
             return None
         text = price_text.lower().replace(",", "")
@@ -242,13 +236,6 @@ class OlxCarsSpider(scrapy.Spider):
         return int(number)
 
     def _extract_jsonld(self, response):
-        """Parses the schema.org JSON-LD block OLX embeds in the raw HTML
-        of every listing page (for Google/SEO purposes). Returns a
-        {label_lowercase: value} dict in the SAME shape as
-        _extract_details_dict/_extract_quick_facts so it can be merged
-        with them directly. This is the most reliable source we have:
-        it's structured data with fixed field names, independent of any
-        CSS-module class name that OLX might change or reuse."""
         result = {}
         scripts = response.css('script[type="application/ld+json"]::text').getall()
         for raw in scripts:
@@ -307,16 +294,10 @@ class OlxCarsSpider(scrapy.Spider):
                     if name and value:
                         result[name] = str(value)
 
-                return result  # found the car entity, no need to keep scanning
+                return result
         return result
 
     def _label_fallback(self, response, *labels):
-        """Class-name-agnostic backup lookup: finds a visible label
-        (e.g. 'Assembly') anywhere on the page by its exact text, and
-        returns the neighbouring value - used when the hashed-class
-        based _extract_details_dict misses a field because that
-        particular listing's page happened to render with different
-        CSS-module class names."""
         for label in labels:
             value = response.xpath(
                 f'//span[normalize-space(string(.))="{label}"]'
@@ -328,11 +309,6 @@ class OlxCarsSpider(scrapy.Spider):
         return None
 
     def _extract_quick_facts(self, response):
-        """Reads the icon row near the top (Year, Transmission, etc) into
-        a {label_lowercase: value} dict. Confirmed structure: each stat is
-        div._948d9e0a.dcd9316f._95d4067f > span (label) + span (value),
-        e.g. <span class="_4b3efad3...">Transmission</span>
-             <span class="_1098edef...">Automatic</span>"""
         result = {}
         rows = response.css('div._948d9e0a.dcd9316f._95d4067f')
         for row in rows:
@@ -343,13 +319,6 @@ class OlxCarsSpider(scrapy.Spider):
         return result
 
     def _extract_details_dict(self, response):
-        """Reads every row inside the 'Details' block into a
-        {label_lowercase: value} dict, e.g. {'make': 'TOYOTA',
-        'body type': 'SUV', 'registration city': 'Lahore', ...}.
-        Confirmed structure: div._90eadc7c > div._0272c9dc > span (label)
-        + span._4ad4c394 (value). Deliberately NOT scoped to
-        div[aria-label="Details"] - that attribute is missing/renamed on
-        some listings, which was silently dropping the whole block."""
         result = {}
         rows = response.css('div._90eadc7c')
         for row in rows:
@@ -372,10 +341,6 @@ class OlxCarsSpider(scrapy.Spider):
         return result
 
     def _extract_location(self, response):
-        """Best-effort fallback for the ad's location (not the same as
-        Registration City) when we don't have it from the search-card
-        meta - e.g. when running via url_file mode. Looks for a known
-        Pakistani city name near the top of the page."""
         cities = [
             "Karachi", "Lahore", "Islamabad", "Rawalpindi", "Faisalabad",
             "Multan", "Gujranwala", "Peshawar", "Sialkot", "Hyderabad",
@@ -389,30 +354,18 @@ class OlxCarsSpider(scrapy.Spider):
         return None
 
     def _extract_posted(self, response):
-        """Best-effort fallback for the relative 'posted X ago' text."""
         match = response.xpath(
             '//*[contains(text(), "ago") or contains(text(), "Today") or contains(text(), "Yesterday")]/text()'
         ).re_first(r"[\w\s]*\bago\b|\bToday\b|\bYesterday\b")
         return self._clean(match)
 
     def _extract_seller(self, response):
-        """Returns (seller_name, seller_type, seller_verified).
-
-        NOTE: earlier version trusted the hashed CSS class (e.g. _8206696c)
-        to identify the name span - but OLX's CSS-module classes are
-        generated from shared styling, not from role, so the same class
-        can land on the "Posted by" label itself on some listings. That's
-        why 'Posted by' was showing up as the seller name. Fixed by never
-        accepting literal "Posted by" text as a name, and scoping the
-        search to inside the profile link only (so we don't accidentally
-        grab a different seller from a "related ads" section)."""
         name = None
         profile_links = response.css('a[href*="/profile/"]')
 
         for link in profile_links:
             spans = [self._clean(s.xpath("string(.)").get()) for s in link.css("span")]
             spans = [s for s in spans if s]
-            # drop the "Posted by" label itself, keep the first real value left
             candidates = [s for s in spans if s.lower() != "posted by"]
             if candidates:
                 name = candidates[0]
@@ -429,11 +382,6 @@ class OlxCarsSpider(scrapy.Spider):
         return name, seller_type, seller_verified
 
     def _extract_features(self, response):
-        """Groups feature chips under their category heading into
-        {"Comfort": [...], "Exterior": [...], ...}. Confirmed structure:
-        div[aria-label="Features"] > div._948d9e0a._68e344b0._95d4067f
-        contains one wrapper div per category, each with a category-name
-        span and a div.ee08ff9c full of span.c327b807 chips."""
         result = {}
         groups = response.css(
             'div[aria-label="Features"] div._948d9e0a._68e344b0._95d4067f > div'
@@ -454,7 +402,6 @@ class OlxCarsSpider(scrapy.Spider):
         for u in urls:
             if not u:
                 continue
-            # strip thumbnail size params so we keep the full-size image
             base = re.sub(r"[-_](s|thumb|small)?\d*x\d*", "", u)
             if base not in seen:
                 seen.add(base)
